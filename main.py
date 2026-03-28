@@ -14,9 +14,8 @@ import aiohttp
 from aiohttp import web
 import json
 import time
-import random
-import os
 import logging
+import os
 from datetime import datetime
 from typing import Set, Dict, Any
 
@@ -27,6 +26,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# ============================================
+# CONFIGURACIÓN SPACEMAN
+# ============================================
 SPACEMAN_WS = 'wss://dga.pragmaticplaylive.net/ws'
 SPACEMAN_CASINO_ID = 'ppcdk00000005349'
 SPACEMAN_CURRENCY = 'BRL'
@@ -42,6 +44,9 @@ MAX_HISTORY = 15000
 
 connected_clients: Set[web.WebSocketResponse] = set()
 
+# ============================================
+# FUNCIONES DE BROADCAST
+# ============================================
 async def broadcast(event_data: Dict[str, Any]):
     if not connected_clients:
         return
@@ -51,6 +56,9 @@ async def broadcast(event_data: Dict[str, Any]):
         return_exceptions=True
     )
 
+# ============================================
+# MONITOREO SPACEMAN
+# ============================================
 async def monitor_spaceman():
     global spaceman_last_multiplier, spaceman_history
     reconnect_delay = BASE_RECONNECT_DELAY
@@ -115,7 +123,9 @@ async def monitor_spaceman():
         await asyncio.sleep(reconnect_delay)
         reconnect_delay = min(MAX_RECONNECT_DELAY, reconnect_delay * 2)
 
-# Servidor WebSocket para clientes
+# ============================================
+# SERVIDOR HTTP + WEBSOCKET (para clientes)
+# ============================================
 async def websocket_handler(request):
     ws = web.WebSocketResponse()
     await ws.prepare(request)
@@ -154,6 +164,9 @@ async def start_web_server():
     logger.info(f"✅ Servidor Spaceman escuchando en puerto {port}")
     await asyncio.Future()
 
+# ============================================
+# MAIN
+# ============================================
 async def main():
     logger.info("=" * 60)
     logger.info("🚀 Monitor exclusivo de SPACEMAN con WebSocket")
