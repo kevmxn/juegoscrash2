@@ -1,16 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-"""
-Monitor exclusivo para SPACEMAN con servidor HTTP y WebSocket
-- Conecta al WebSocket de Pragmatic Play
-- Envía historial a clientes WebSocket al conectar
-- Broadcast de nuevos eventos de Spaceman
-- Extrae correctamente el ID de la jugada
-- Reconexión automática con backoff exponencial
-- Auto‑ping cada 10 minutos para evitar que Render suspenda el servicio
-"""
-
 import asyncio
 import aiohttp
 from aiohttp import web
@@ -28,9 +18,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ============================================
-# CONFIGURACIÓN SPACEMAN
-# ============================================
 SPACEMAN_WS = 'wss://dga.pragmaticplaylive.net/ws'
 SPACEMAN_CASINO_ID = 'ppcdk00000005349'
 SPACEMAN_CURRENCY = 'BRL'
@@ -43,30 +30,10 @@ spaceman_last_multiplier: float = None
 spaceman_events_seen: Set[str] = set()
 spaceman_history: list = []
 MAX_HISTORY = 15000
+CHUNK_SIZE = 300
 
 connected_clients: Set[web.WebSocketResponse] = set()
 
-# ============================================
-# AUTO‑PING PARA MANTENER EL SERVICIO ACTIVO
-# ============================================
-async def self_ping():
-    port = int(os.environ.get('PORT', 10000))
-    url = f"http://localhost:{port}/health"
-    while True:
-        await asyncio.sleep(600)  # 10 minutos
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, timeout=5) as resp:
-                    if resp.status == 200:
-                        logger.info("[PING] Auto‑ping exitoso, servicio activo")
-                    else:
-                        logger.warning(f"[PING] Auto‑ping falló con código {resp.status}")
-        except Exception as e:
-            logger.error(f"[PING] Error en auto‑ping: {e}")
-
-# ============================================
-# FUNCIONES DE BROADCAST
-# ============================================
 async def broadcast(event_data: Dict[str, Any]):
     if not connected_clients:
         return
@@ -76,9 +43,6 @@ async def broadcast(event_data: Dict[str, Any]):
         return_exceptions=True
     )
 
-# ============================================
-# MONITOREO SPACEMAN
-# ============================================
 async def monitor_spaceman():
     global spaceman_last_multiplier, spaceman_history
     reconnect_delay = BASE_RECONNECT_DELAY
@@ -103,7 +67,6 @@ async def monitor_spaceman():
                         if msg.type == aiohttp.WSMsgType.TEXT:
                             try:
                                 data = msg.json()
-                                # Extraer el resultado del juego
                                 if "gameResult" in data and data["gameResult"]:
                                     result_obj = data["gameResult"][0]
                                     result_str = result_obj.get("result")
@@ -111,24 +74,18 @@ async def monitor_spaceman():
                                         multiplier = float(result_str)
                                         if multiplier >= 1.00 and multiplier != spaceman_last_multiplier:
                                             spaceman_last_multiplier = multiplier
-                                            # Extraer ID de la jugada (priorizar campos conocidos)
                                             game_id = None
-                                            # Intentar en el objeto principal
                                             if "gameId" in data and data["gameId"]:
                                                 game_id = data["gameId"]
                                             elif "id" in data and data["id"]:
                                                 game_id = data["id"]
-                                            # Si no, buscar dentro del objeto de resultado
                                             elif "gameId" in result_obj and result_obj["gameId"]:
                                                 game_id = result_obj["gameId"]
                                             elif "id" in result_obj and result_obj["id"]:
                                                 game_id = result_obj["id"]
-                                            # Último recurso: usar timestamp
                                             if not game_id:
                                                 game_id = f"spaceman_{int(time.time())}"
                                                 logger.warning(f"[SPACEMAN] No se encontró ID, usando generado: {game_id}")
-                                            
-                                            # Evitar duplicados
                                             if game_id not in spaceman_events_seen:
                                                 spaceman_events_seen.add(game_id)
                                                 evento = {
@@ -147,12 +104,9 @@ async def monitor_spaceman():
                                                     'timestamp_recepcion': evento['timestamp_recepcion']
                                                 })
                                             else:
-                                                logger.info(f"[SPACEMAN] ⚠️ Duplicado: GameID={game_id} | {multiplier:.2f}x")
-                            except (json.JSONDecodeError, KeyError, ValueError, IndexError) as e:
-                                # Ignorar mensajes no relevantes
+                                                logger.info(f"[SPACEMAN] ⚠️ Duplicado: {game_id}")
+                            except (json.JSONDecodeError, KeyError, ValueError, IndexError):
                                 pass
-                            except Exception as e:
-                                logger.error(f"[SPACEMAN] Error procesando mensaje: {e}")
                         elif msg.type == aiohttp.WSMsgType.CLOSE:
                             logger.info("[SPACEMAN] 🔌 Conexión cerrada")
                             break
@@ -165,21 +119,30 @@ async def monitor_spaceman():
         await asyncio.sleep(reconnect_delay)
         reconnect_delay = min(MAX_RECONNECT_DELAY, reconnect_delay * 2)
 
-# ============================================
-# SERVIDOR HTTP + WEBSOCKET (para clientes)
-# ============================================
 async def websocket_handler(request):
     ws = web.WebSocketResponse()
     await ws.prepare(request)
     connected_clients.add(ws)
     try:
         if spaceman_history:
+            total = len(spaceman_history)
             await ws.send_json({
-                'tipo': 'historial',
+                'tipo': 'historial_meta',
                 'api': 'spaceman',
-                'eventos': spaceman_history
+                'total': total,
+                'chunk_size': CHUNK_SIZE
             })
-        logger.info("Cliente Spaceman conectado, historial enviado")
+            for i in range(0, total, CHUNK_SIZE):
+                chunk = spaceman_history[i:i+CHUNK_SIZE]
+                await ws.send_json({
+                    'tipo': 'historial_chunk',
+                    'api': 'spaceman',
+                    'chunk': chunk,
+                    'chunk_index': i // CHUNK_SIZE,
+                    'total_chunks': (total + CHUNK_SIZE - 1) // CHUNK_SIZE
+                })
+                await asyncio.sleep(0.01)
+        logger.info("Cliente Spaceman conectado, historial enviado en lotes")
         async for msg in ws:
             if msg.type == web.WSMsgType.CLOSE:
                 break
@@ -206,12 +169,22 @@ async def start_web_server():
     logger.info(f"✅ Servidor Spaceman escuchando en puerto {port}")
     await asyncio.Future()
 
-# ============================================
-# MAIN
-# ============================================
+async def self_ping():
+    port = int(os.environ.get('PORT', 10000))
+    url = f"http://localhost:{port}/health"
+    while True:
+        await asyncio.sleep(600)
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=5) as resp:
+                    if resp.status == 200:
+                        logger.debug("[PING] Auto‑ping exitoso")
+        except Exception:
+            pass
+
 async def main():
     logger.info("=" * 60)
-    logger.info("🚀 Monitor exclusivo de SPACEMAN con WebSocket y auto‑ping")
+    logger.info("🚀 Monitor SPACEMAN con envío de historial en lotes (CHUNK=300)")
     logger.info("=" * 60)
     tasks = [
         asyncio.create_task(start_web_server()),
@@ -221,7 +194,6 @@ async def main():
     try:
         await asyncio.gather(*tasks)
     except KeyboardInterrupt:
-        logger.info("\n⏹ Deteniendo...")
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
