@@ -2,12 +2,12 @@
 # -*- coding: utf-8 -*-
 
 """
-Monitor exclusivo para CRASH con servidor HTTP y WebSocket
-- Polling a la API de Stake Crash con headers sin Brotli
+Monitor exclusivo para SPACEMAN con servidor HTTP y WebSocket
+- Conecta al WebSocket de Pragmatic Play
 - Envía historial (últimos 100 eventos) y tabla de niveles al conectar
-- Broadcast de nuevos eventos de Crash
+- Broadcast de nuevos eventos de Spaceman
+- Reconexión automática con backoff exponencial
 - Persistencia con SQLite
-- Backoff exponencial y circuit breaker
 - Auto‑ping cada 10 minutos para evitar que Render suspenda el servicio
 """
 
@@ -16,7 +16,6 @@ import aiohttp
 from aiohttp import web
 import json
 import time
-import random
 import logging
 import os
 from datetime import datetime
@@ -32,42 +31,20 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ============================================
-# CONFIGURACIÓN CRASH
+# CONFIGURACIÓN SPACEMAN
 # ============================================
-API_CRASH = 'https://api-cs.casino.org/svc-evolution-game-events/api/stakecrash/latest'
-DB_PATH = "crash_data.db"
+SPACEMAN_WS = 'wss://dga.pragmaticplaylive.net/ws'
+SPACEMAN_CASINO_ID = 'ppcdk00000005349'
+SPACEMAN_CURRENCY = 'BRL'
+SPACEMAN_GAME_ID = 1301
+DB_PATH = "spaceman_data.db"
 
-USER_AGENTS = [
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Windows NT 10.0; rv:121.0) Gecko/20100101 Firefox/121.0',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15',
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36 Edg/118.0.2088.76',
-    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/115.0',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:109.0) Gecko/20100101 Firefox/118.0',
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 OPR/106.0.0.0',
-    'Mozilla/5.0 (iPad; CPU OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:109.0) Gecko/20100101 Firefox/119.0',
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Linux; Android 13; SM-G991B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36',
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (X11; Linux x86_64; rv:109.0) Gecko/20100101 Firefox/117.0',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_14_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-]
+BASE_RECONNECT_DELAY = 1.0
+MAX_RECONNECT_DELAY = 60.0
 
-BASE_SLEEP = 1.0
-MAX_SLEEP = 60.0
-MAX_CONSECUTIVE_ERRORS = 10
-BLOCK_TIME = 300
-
-crash_ids: Set[str] = set()
-crash_status = {'consecutive_errors': 0, 'next_allowed_time': 0, 'blocked_until': 0}
-crash_history: list = []
+spaceman_last_multiplier: float = None
+spaceman_events_seen: Set[str] = set()
+spaceman_history: list = []
 MAX_HISTORY = 100
 
 current_level = 0
@@ -84,8 +61,6 @@ async def init_db():
             CREATE TABLE IF NOT EXISTS events (
                 id TEXT PRIMARY KEY,
                 maxMultiplier REAL,
-                roundDuration REAL,
-                startedAt TEXT,
                 timestamp_recepcion TEXT,
                 nivel INTEGER
             )
@@ -107,23 +82,21 @@ async def init_db():
         await db.commit()
 
 async def load_from_db():
-    global crash_history, crash_ids, level_counts, current_level
+    global spaceman_history, spaceman_events_seen, level_counts, current_level
     async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute('SELECT id, maxMultiplier, roundDuration, startedAt, timestamp_recepcion, nivel FROM events ORDER BY timestamp_recepcion DESC LIMIT ?', (MAX_HISTORY,)) as cursor:
+        async with db.execute('SELECT id, maxMultiplier, timestamp_recepcion, nivel FROM events ORDER BY timestamp_recepcion DESC LIMIT ?', (MAX_HISTORY,)) as cursor:
             rows = await cursor.fetchall()
-            crash_history = []
-            crash_ids.clear()
+            spaceman_history = []
+            spaceman_events_seen.clear()
             for row in rows:
                 event = {
                     'event_id': row[0],
                     'maxMultiplier': row[1],
-                    'roundDuration': row[2],
-                    'startedAt': row[3],
-                    'timestamp_recepcion': row[4],
-                    'nivel': row[5]
+                    'timestamp_recepcion': row[2],
+                    'nivel': row[3]
                 }
-                crash_history.append(event)
-                crash_ids.add(row[0])
+                spaceman_history.append(event)
+                spaceman_events_seen.add(row[0])
         async with db.execute('SELECT level, range, count FROM counts') as cursor:
             rows = await cursor.fetchall()
             level_counts.clear()
@@ -141,9 +114,9 @@ async def load_from_db():
 async def save_event(event: dict):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute('''
-            INSERT OR REPLACE INTO events (id, maxMultiplier, roundDuration, startedAt, timestamp_recepcion, nivel)
-            VALUES (?, ?, ?, ?, ?, ?)
-        ''', (event['event_id'], event['maxMultiplier'], event.get('roundDuration'), event['startedAt'], event['timestamp_recepcion'], event['nivel']))
+            INSERT OR REPLACE INTO events (id, maxMultiplier, timestamp_recepcion, nivel)
+            VALUES (?, ?, ?, ?)
+        ''', (event['event_id'], event['maxMultiplier'], event['timestamp_recepcion'], event['nivel']))
         await db.execute('''
             DELETE FROM events WHERE id NOT IN (
                 SELECT id FROM events ORDER BY timestamp_recepcion DESC LIMIT ?
@@ -167,7 +140,7 @@ async def update_current_level(level: int):
         await db.commit()
 
 # ============================================
-# AUTO‑PING PARA MANTENER EL SERVICIO ACTIVO
+# AUTO‑PING
 # ============================================
 async def self_ping():
     port = int(os.environ.get('PORT', 10000))
@@ -185,159 +158,95 @@ async def self_ping():
             logger.error(f"[PING] Error en auto‑ping: {e}")
 
 # ============================================
-# FUNCIONES CRASH
+# MONITOREO SPACEMAN
 # ============================================
-def get_random_user_agent() -> str:
-    return random.choice(USER_AGENTS)
+async def monitor_spaceman():
+    global current_level, spaceman_last_multiplier, spaceman_history, level_counts
+    reconnect_delay = BASE_RECONNECT_DELAY
+    logger.info("[SPACEMAN] 🚀 Iniciando monitor")
 
-async def consultar_crash(session: aiohttp.ClientSession) -> dict | None:
-    now = time.time()
-    if now < crash_status['blocked_until']:
-        wait = crash_status['blocked_until'] - now
-        logger.info(f"[CRASH] 🚫 Bloqueado por {wait:.1f}s")
-        await asyncio.sleep(wait)
-        return None
-    if now < crash_status['next_allowed_time']:
-        wait = crash_status['next_allowed_time'] - now
-        logger.info(f"[CRASH] ⏳ Backoff {wait:.1f}s")
-        await asyncio.sleep(wait)
-        return None
+    while True:
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.ws_connect(SPACEMAN_WS) as ws:
+                    logger.info("[SPACEMAN] ✅ WebSocket conectado")
+                    subscribe_msg = {
+                        "type": "subscribe",
+                        "casinoId": SPACEMAN_CASINO_ID,
+                        "currency": SPACEMAN_CURRENCY,
+                        "key": [SPACEMAN_GAME_ID]
+                    }
+                    await ws.send_json(subscribe_msg)
+                    logger.info("[SPACEMAN] 📡 Suscripción enviada")
+                    reconnect_delay = BASE_RECONNECT_DELAY
 
-    headers = {
-        'User-Agent': get_random_user_agent(),
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-        'Accept-Language': 'es-ES,es;q=0.8,en-US;q=0.5,en;q=0.3',
-        'Accept-Encoding': 'gzip, deflate',
-        'Connection': 'keep-alive',
-        'Upgrade-Insecure-Requests': '1',
-    }
+                    async for msg in ws:
+                        if msg.type == aiohttp.WSMsgType.TEXT:
+                            try:
+                                data = msg.json()
+                                if "gameResult" in data and data["gameResult"]:
+                                    result_str = data["gameResult"][0].get("result")
+                                    if result_str:
+                                        multiplier = float(result_str)
+                                        if multiplier >= 1.00 and multiplier != spaceman_last_multiplier:
+                                            spaceman_last_multiplier = multiplier
+                                            game_id = data.get("gameId", "unknown")
+                                            if game_id not in spaceman_events_seen:
+                                                spaceman_events_seen.add(game_id)
 
-    try:
-        async with session.get(API_CRASH, headers=headers, timeout=10) as resp:
-            if 'Retry-After' in resp.headers:
-                retry_after = int(resp.headers['Retry-After'])
-                crash_status['next_allowed_time'] = time.time() + retry_after
-                crash_status['consecutive_errors'] += 1
-                logger.warning(f"[CRASH] ⚠️ Esperar {retry_after}s (Retry-After)")
-                return None
-            if resp.status == 200:
-                crash_status['consecutive_errors'] = 0
-                return await resp.json()
-            elif resp.status == 403:
-                crash_status['consecutive_errors'] += 1
-                backoff = min(MAX_SLEEP, BASE_SLEEP * (2 ** crash_status['consecutive_errors']))
-                crash_status['next_allowed_time'] = time.time() + backoff
-                logger.warning(f"[CRASH] 🚫 403 Forbidden - backoff {backoff:.1f}s")
-                if crash_status['consecutive_errors'] >= MAX_CONSECUTIVE_ERRORS:
-                    crash_status['blocked_until'] = time.time() + BLOCK_TIME
-                    logger.error(f"[CRASH] 🔒 Bloqueado {BLOCK_TIME}s")
-                return None
-            elif resp.status == 429:
-                retry_after = int(resp.headers.get('Retry-After', 2 ** crash_status['consecutive_errors']))
-                crash_status['next_allowed_time'] = time.time() + retry_after
-                crash_status['consecutive_errors'] += 1
-                logger.warning(f"[CRASH] ⚠️ Rate limit, esperar {retry_after}s")
-                if crash_status['consecutive_errors'] >= MAX_CONSECUTIVE_ERRORS:
-                    crash_status['blocked_until'] = time.time() + BLOCK_TIME
-                return None
-            elif 500 <= resp.status < 600:
-                crash_status['consecutive_errors'] += 1
-                backoff = min(MAX_SLEEP, BASE_SLEEP * (2 ** crash_status['consecutive_errors']))
-                crash_status['next_allowed_time'] = time.time() + backoff
-                logger.error(f"[CRASH] ❌ Error {resp.status}, backoff {backoff:.1f}s")
-                if crash_status['consecutive_errors'] >= MAX_CONSECUTIVE_ERRORS:
-                    crash_status['blocked_until'] = time.time() + BLOCK_TIME
-                return None
-            else:
-                logger.warning(f"[CRASH] ⚠️ Código inesperado: {resp.status}")
-                crash_status['consecutive_errors'] += 1
-                backoff = min(MAX_SLEEP, BASE_SLEEP * (2 ** crash_status['consecutive_errors']))
-                crash_status['next_allowed_time'] = time.time() + backoff
-                if crash_status['consecutive_errors'] >= MAX_CONSECUTIVE_ERRORS:
-                    crash_status['blocked_until'] = time.time() + BLOCK_TIME
-                return None
-    except asyncio.TimeoutError:
-        crash_status['consecutive_errors'] += 1
-        backoff = min(MAX_SLEEP, BASE_SLEEP * (2 ** crash_status['consecutive_errors']))
-        crash_status['next_allowed_time'] = time.time() + backoff
-        logger.error(f"[CRASH] ⏰ Timeout, backoff {backoff:.1f}s")
-        if crash_status['consecutive_errors'] >= MAX_CONSECUTIVE_ERRORS:
-            crash_status['blocked_until'] = time.time() + BLOCK_TIME
-        return None
-    except Exception as e:
-        crash_status['consecutive_errors'] += 1
-        backoff = min(MAX_SLEEP, BASE_SLEEP * (2 ** crash_status['consecutive_errors']))
-        crash_status['next_allowed_time'] = time.time() + backoff
-        logger.error(f"[CRASH] 💥 Excepción: {e}")
-        if crash_status['consecutive_errors'] >= MAX_CONSECUTIVE_ERRORS:
-            crash_status['blocked_until'] = time.time() + BLOCK_TIME
-        return None
+                                                if multiplier < 2.00:
+                                                    current_level -= 1
+                                                else:
+                                                    current_level += 1
 
-async def procesar_crash(data: dict):
-    global current_level, crash_history, level_counts
-    event_id = data.get('id')
-    if not event_id or event_id in crash_ids:
-        return
-    crash_ids.add(event_id)
-    data_inner = data.get('data', {})
-    result = data_inner.get('result', {})
-    max_mult = result.get('maxMultiplier')
-    round_dur = result.get('roundDuration')
-    started_at = data_inner.get('startedAt')
-    if max_mult is not None and max_mult > 0:
-        if max_mult < 2.00:
-            current_level -= 1
-        else:
-            current_level += 1
+                                                range_key = None
+                                                if 3.00 <= multiplier <= 4.99:
+                                                    range_key = '3-4.99'
+                                                elif 5.00 <= multiplier <= 9.99:
+                                                    range_key = '5-9.99'
+                                                elif multiplier >= 10.00:
+                                                    range_key = '10+'
 
-        range_key = None
-        if 3.00 <= max_mult <= 4.99:
-            range_key = '3-4.99'
-        elif 5.00 <= max_mult <= 9.99:
-            range_key = '5-9.99'
-        elif max_mult >= 10.00:
-            range_key = '10+'
+                                                evento = {
+                                                    'event_id': game_id,
+                                                    'maxMultiplier': multiplier,
+                                                    'timestamp_recepcion': datetime.now().isoformat(),
+                                                    'nivel': current_level
+                                                }
+                                                spaceman_history.insert(0, evento)
+                                                if len(spaceman_history) > MAX_HISTORY:
+                                                    spaceman_history.pop()
+                                                if range_key:
+                                                    level_counts[current_level][range_key] += 1
 
-        evento = {
-            'event_id': event_id,
-            'maxMultiplier': max_mult,
-            'roundDuration': round_dur,
-            'startedAt': started_at,
-            'timestamp_recepcion': datetime.now().isoformat(),
-            'nivel': current_level
-        }
-        crash_history.insert(0, evento)
-        if len(crash_history) > MAX_HISTORY:
-            crash_history.pop()
-        if range_key:
-            level_counts[current_level][range_key] += 1
+                                                await save_event(evento)
+                                                if range_key:
+                                                    await update_count(current_level, range_key)
+                                                await update_current_level(current_level)
 
-        await save_event(evento)
-        if range_key:
-            await update_count(current_level, range_key)
-        await update_current_level(current_level)
+                                                logger.info(f"[SPACEMAN] 🚀 NUEVO: GameID={game_id} | {multiplier:.2f}x | Nivel={current_level}")
+                                                await broadcast({
+                                                    'tipo': 'spaceman',
+                                                    'id': game_id,
+                                                    'maxMultiplier': multiplier,
+                                                    'timestamp_recepcion': evento['timestamp_recepcion'],
+                                                    'nivel': current_level
+                                                })
+                                            else:
+                                                logger.info(f"[SPACEMAN] ⚠️ Duplicado: GameID={game_id} | {multiplier:.2f}x")
+                            except (json.JSONDecodeError, KeyError, ValueError, IndexError):
+                                pass
+                        elif msg.type == aiohttp.WSMsgType.CLOSE:
+                            logger.info("[SPACEMAN] 🔌 Conexión cerrada")
+                            break
+                        elif msg.type == aiohttp.WSMsgType.ERROR:
+                            logger.error(f"[SPACEMAN] ❌ Error: {ws.exception()}")
+                            break
+        except Exception as e:
+            logger.error(f"[SPACEMAN] 💥 {e}, reconexión en {reconnect_delay:.1f}s")
 
-        logger.info(f"[CRASH] ✅ NUEVO: ID={event_id} | {max_mult}x | Duración={round_dur}s | Inicio={started_at} | Nivel={current_level}")
-        await broadcast({
-            'tipo': 'crash',
-            'id': event_id,
-            'maxMultiplier': max_mult,
-            'roundDuration': round_dur,
-            'startedAt': started_at,
-            'timestamp_recepcion': evento['timestamp_recepcion'],
-            'nivel': current_level
-        })
-    else:
-        logger.warning(f"[CRASH] ⚠️ ID {event_id} mult inválido: {max_mult}")
-
-async def monitor_crash():
-    logger.info("[CRASH] 🚀 Iniciando monitor")
-    async with aiohttp.ClientSession() as session:
-        while True:
-            data = await consultar_crash(session)
-            if data:
-                await procesar_crash(data)
-            await asyncio.sleep(random.uniform(0.5, 1.5))
+        await asyncio.sleep(reconnect_delay)
+        reconnect_delay = min(MAX_RECONNECT_DELAY, reconnect_delay * 2)
 
 # ============================================
 # SERVIDOR HTTP + WEBSOCKET
@@ -356,18 +265,18 @@ async def websocket_handler(request):
     await ws.prepare(request)
     connected_clients.add(ws)
     try:
-        if crash_history:
+        if spaceman_history:
             await ws.send_json({
                 'tipo': 'historial',
-                'api': 'crash',
-                'eventos': crash_history
+                'api': 'spaceman',
+                'eventos': spaceman_history
             })
         await ws.send_json({
             'tipo': 'nivel_counts',
             'nivel_actual': current_level,
             'conteos': {k: dict(v) for k, v in level_counts.items()}
         })
-        logger.info("Cliente Crash conectado, historial y tabla de niveles enviados")
+        logger.info("Cliente Spaceman conectado, historial y tabla de niveles enviados")
         async for msg in ws:
             if msg.type == web.WSMsgType.CLOSE:
                 break
@@ -379,7 +288,7 @@ async def health_handler(request):
     return web.Response(text="OK", status=200)
 
 async def root_handler(request):
-    return web.Response(text="Servidor Crash activo. Use /ws para WebSocket o /health para health check.", status=200)
+    return web.Response(text="Servidor Spaceman activo. Use /ws para WebSocket o /health para health check.", status=200)
 
 async def start_web_server():
     app = web.Application()
@@ -391,7 +300,7 @@ async def start_web_server():
     port = int(os.environ.get('PORT', 10000))
     site = web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
-    logger.info(f"✅ Servidor Crash escuchando en puerto {port}")
+    logger.info(f"✅ Servidor Spaceman escuchando en puerto {port}")
     await asyncio.Future()
 
 # ============================================
@@ -399,13 +308,13 @@ async def start_web_server():
 # ============================================
 async def main():
     logger.info("=" * 60)
-    logger.info("🚀 Monitor exclusivo de CRASH con WebSocket, auto‑ping y SQLite")
+    logger.info("🚀 Monitor exclusivo de SPACEMAN con WebSocket, auto‑ping y SQLite")
     logger.info("=" * 60)
     await init_db()
     await load_from_db()
     tasks = [
         asyncio.create_task(start_web_server()),
-        asyncio.create_task(monitor_crash()),
+        asyncio.create_task(monitor_spaceman()),
         asyncio.create_task(self_ping()),
     ]
     try:
