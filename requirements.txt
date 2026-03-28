@@ -3,3 +3,4 @@ websockets==12.0
 requests==2.31.0
 websocket-client==1.8.0
 brotli
+aiosqlite
