@@ -6,6 +6,7 @@ Monitor exclusivo para SPACEMAN con servidor HTTP y WebSocket
 - Conecta al WebSocket de Pragmatic Play
 - Envía historial a clientes WebSocket al conectar
 - Broadcast de nuevos eventos de Spaceman
+- Extrae correctamente el ID de la jugada
 - Reconexión automática con backoff exponencial
 - Auto‑ping cada 10 minutos para evitar que Render suspenda el servicio
 """
@@ -46,22 +47,9 @@ MAX_HISTORY = 15000
 connected_clients: Set[web.WebSocketResponse] = set()
 
 # ============================================
-# FUNCIONES DE BROADCAST
-# ============================================
-async def broadcast(event_data: Dict[str, Any]):
-    if not connected_clients:
-        return
-    message = json.dumps(event_data, default=str)
-    await asyncio.gather(
-        *[client.send_str(message) for client in connected_clients],
-        return_exceptions=True
-    )
-
-# ============================================
 # AUTO‑PING PARA MANTENER EL SERVICIO ACTIVO
 # ============================================
 async def self_ping():
-    """Hace una petición a /health cada 10 minutos para evitar que Render suspenda el servicio."""
     port = int(os.environ.get('PORT', 10000))
     url = f"http://localhost:{port}/health"
     while True:
@@ -75,6 +63,18 @@ async def self_ping():
                         logger.warning(f"[PING] Auto‑ping falló con código {resp.status}")
         except Exception as e:
             logger.error(f"[PING] Error en auto‑ping: {e}")
+
+# ============================================
+# FUNCIONES DE BROADCAST
+# ============================================
+async def broadcast(event_data: Dict[str, Any]):
+    if not connected_clients:
+        return
+    message = json.dumps(event_data, default=str)
+    await asyncio.gather(
+        *[client.send_str(message) for client in connected_clients],
+        return_exceptions=True
+    )
 
 # ============================================
 # MONITOREO SPACEMAN
@@ -103,13 +103,32 @@ async def monitor_spaceman():
                         if msg.type == aiohttp.WSMsgType.TEXT:
                             try:
                                 data = msg.json()
+                                # Extraer el resultado del juego
                                 if "gameResult" in data and data["gameResult"]:
-                                    result_str = data["gameResult"][0].get("result")
+                                    result_obj = data["gameResult"][0]
+                                    result_str = result_obj.get("result")
                                     if result_str:
                                         multiplier = float(result_str)
                                         if multiplier >= 1.00 and multiplier != spaceman_last_multiplier:
                                             spaceman_last_multiplier = multiplier
-                                            game_id = data.get("gameId", "unknown")
+                                            # Extraer ID de la jugada (priorizar campos conocidos)
+                                            game_id = None
+                                            # Intentar en el objeto principal
+                                            if "gameId" in data and data["gameId"]:
+                                                game_id = data["gameId"]
+                                            elif "id" in data and data["id"]:
+                                                game_id = data["id"]
+                                            # Si no, buscar dentro del objeto de resultado
+                                            elif "gameId" in result_obj and result_obj["gameId"]:
+                                                game_id = result_obj["gameId"]
+                                            elif "id" in result_obj and result_obj["id"]:
+                                                game_id = result_obj["id"]
+                                            # Último recurso: usar timestamp
+                                            if not game_id:
+                                                game_id = f"spaceman_{int(time.time())}"
+                                                logger.warning(f"[SPACEMAN] No se encontró ID, usando generado: {game_id}")
+                                            
+                                            # Evitar duplicados
                                             if game_id not in spaceman_events_seen:
                                                 spaceman_events_seen.add(game_id)
                                                 evento = {
@@ -129,8 +148,11 @@ async def monitor_spaceman():
                                                 })
                                             else:
                                                 logger.info(f"[SPACEMAN] ⚠️ Duplicado: GameID={game_id} | {multiplier:.2f}x")
-                            except (json.JSONDecodeError, KeyError, ValueError, IndexError):
+                            except (json.JSONDecodeError, KeyError, ValueError, IndexError) as e:
+                                # Ignorar mensajes no relevantes
                                 pass
+                            except Exception as e:
+                                logger.error(f"[SPACEMAN] Error procesando mensaje: {e}")
                         elif msg.type == aiohttp.WSMsgType.CLOSE:
                             logger.info("[SPACEMAN] 🔌 Conexión cerrada")
                             break
