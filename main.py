@@ -52,6 +52,10 @@ level_counts = defaultdict(lambda: {'3-4.99': 0, '5-9.99': 0, '10+': 0})
 
 connected_clients: Set[web.WebSocketResponse] = set()
 
+# Variables para generación de IDs locales (cuando no se encuentra ID real)
+_last_gen_time = 0.0
+_gen_counter = 0
+
 # ============================================
 # FUNCIONES DE BASE DE DATOS
 # ============================================
@@ -161,7 +165,7 @@ async def self_ping():
 # MONITOREO SPACEMAN
 # ============================================
 async def monitor_spaceman():
-    global current_level, spaceman_last_multiplier, spaceman_history, level_counts
+    global current_level, spaceman_last_multiplier, spaceman_history, level_counts, _last_gen_time, _gen_counter
     reconnect_delay = BASE_RECONNECT_DELAY
     logger.info("[SPACEMAN] 🚀 Iniciando monitor")
 
@@ -190,15 +194,48 @@ async def monitor_spaceman():
                                         multiplier = float(result_str)
                                         if multiplier >= 1.00 and multiplier != spaceman_last_multiplier:
                                             spaceman_last_multiplier = multiplier
-                                            game_id = data.get("gameId", "unknown")
+
+                                            # Intentar obtener ID real desde varios campos posibles
+                                            game_id = None
+                                            # Primero en la raíz
+                                            if "gameId" in data:
+                                                game_id = data["gameId"]
+                                            elif "roundId" in data:
+                                                game_id = data["roundId"]
+                                            elif "id" in data:
+                                                game_id = data["id"]
+                                            # Si no, dentro del primer gameResult
+                                            elif "gameResult" in data and data["gameResult"]:
+                                                first_result = data["gameResult"][0]
+                                                if "gameId" in first_result:
+                                                    game_id = first_result["gameId"]
+                                                elif "roundId" in first_result:
+                                                    game_id = first_result["roundId"]
+                                                elif "id" in first_result:
+                                                    game_id = first_result["id"]
+
+                                            # Si aún no tenemos ID, generamos uno único
+                                            if not game_id:
+                                                now = time.time()
+                                                if now == _last_gen_time:
+                                                    _gen_counter += 1
+                                                else:
+                                                    _last_gen_time = now
+                                                    _gen_counter = 0
+                                                ts_str = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+                                                game_id = f"spaceman_{ts_str}_{_gen_counter}_{multiplier:.2f}"
+                                                logger.warning(f"[SPACEMAN] ⚠️ ID no encontrado. Generado: {game_id}")
+
                                             if game_id not in spaceman_events_seen:
                                                 spaceman_events_seen.add(game_id)
 
+                                                # Actualizar nivel según el multiplicador
                                                 if multiplier < 2.00:
                                                     current_level -= 1
                                                 else:
                                                     current_level += 1
 
+                                                # Determinar rango para contador
                                                 range_key = None
                                                 if 3.00 <= multiplier <= 4.99:
                                                     range_key = '3-4.99'
@@ -219,6 +256,7 @@ async def monitor_spaceman():
                                                 if range_key:
                                                     level_counts[current_level][range_key] += 1
 
+                                                # Persistir
                                                 await save_event(evento)
                                                 if range_key:
                                                     await update_count(current_level, range_key)
@@ -234,8 +272,8 @@ async def monitor_spaceman():
                                                 })
                                             else:
                                                 logger.info(f"[SPACEMAN] ⚠️ Duplicado: GameID={game_id} | {multiplier:.2f}x")
-                            except (json.JSONDecodeError, KeyError, ValueError, IndexError):
-                                pass
+                            except (json.JSONDecodeError, KeyError, ValueError, IndexError) as e:
+                                logger.debug(f"[SPACEMAN] Error procesando mensaje: {e}")
                         elif msg.type == aiohttp.WSMsgType.CLOSE:
                             logger.info("[SPACEMAN] 🔌 Conexión cerrada")
                             break
