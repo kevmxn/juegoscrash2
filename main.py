@@ -53,17 +53,14 @@ async def consultar_slide(session: aiohttp.ClientSession) -> dict | None:
         await asyncio.sleep(wait)
         return None
 
+    # Headers simplificados y sin 'br'
     headers = {
         'User-Agent': get_random_user_agent(),
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
-        'Accept-Language': 'es-ES,es;q=0.9,en;q=0.8',
-        'Accept-Encoding': 'gzip, deflate, br',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+        'Accept-Language': 'es-ES,es;q=0.8,en-US;q=0.5,en;q=0.3',
+        'Accept-Encoding': 'gzip, deflate',
         'Connection': 'keep-alive',
         'Upgrade-Insecure-Requests': '1',
-        'Sec-Fetch-Dest': 'document',
-        'Sec-Fetch-Mode': 'navigate',
-        'Sec-Fetch-Site': 'none',
-        'Sec-Fetch-User': '?1',
         'Cache-Control': 'max-age=0',
         'Referer': 'https://stake.com/',
         'Origin': 'https://stake.com',
@@ -168,8 +165,8 @@ async def monitor_slide():
             data = await consultar_slide(session)
             if data:
                 await procesar_slide(data)
-            # Intervalo más amplio: entre 1.5 y 3.0 segundos
-            await asyncio.sleep(random.uniform(1.5, 3.0))
+            # Espera mucho más larga: entre 5 y 10 segundos
+            await asyncio.sleep(random.uniform(5.0, 10.0))
 
 async def broadcast(event_data: Dict[str, Any]):
     if not connected_clients:
@@ -245,7 +242,7 @@ async def self_ping():
 
 async def main():
     logger.info("=" * 60)
-    logger.info("🚀 Monitor SLIDE con envío de historial en lotes (300)")
+    logger.info("🚀 Monitor SLIDE con polling lento (5-10s) y envío de historial en lotes")
     logger.info("=" * 60)
     tasks = [
         asyncio.create_task(start_web_server()),
