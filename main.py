@@ -7,6 +7,7 @@ Monitor exclusivo para SPACEMAN con servidor HTTP y WebSocket
 - Envía historial a clientes WebSocket al conectar
 - Broadcast de nuevos eventos de Spaceman
 - Reconexión automática con backoff exponencial
+- Auto‑ping cada 10 minutos para evitar que Render suspenda el servicio
 """
 
 import asyncio
@@ -55,6 +56,25 @@ async def broadcast(event_data: Dict[str, Any]):
         *[client.send_str(message) for client in connected_clients],
         return_exceptions=True
     )
+
+# ============================================
+# AUTO‑PING PARA MANTENER EL SERVICIO ACTIVO
+# ============================================
+async def self_ping():
+    """Hace una petición a /health cada 10 minutos para evitar que Render suspenda el servicio."""
+    port = int(os.environ.get('PORT', 10000))
+    url = f"http://localhost:{port}/health"
+    while True:
+        await asyncio.sleep(600)  # 10 minutos
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=5) as resp:
+                    if resp.status == 200:
+                        logger.info("[PING] Auto‑ping exitoso, servicio activo")
+                    else:
+                        logger.warning(f"[PING] Auto‑ping falló con código {resp.status}")
+        except Exception as e:
+            logger.error(f"[PING] Error en auto‑ping: {e}")
 
 # ============================================
 # MONITOREO SPACEMAN
@@ -169,11 +189,12 @@ async def start_web_server():
 # ============================================
 async def main():
     logger.info("=" * 60)
-    logger.info("🚀 Monitor exclusivo de SPACEMAN con WebSocket")
+    logger.info("🚀 Monitor exclusivo de SPACEMAN con WebSocket y auto‑ping")
     logger.info("=" * 60)
     tasks = [
         asyncio.create_task(start_web_server()),
         asyncio.create_task(monitor_spaceman()),
+        asyncio.create_task(self_ping()),
     ]
     try:
         await asyncio.gather(*tasks)
