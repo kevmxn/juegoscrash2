@@ -5,10 +5,10 @@
 Monitor exclusivo para SPACEMAN con servidor HTTP y WebSocket
 - Conecta al WebSocket de Pragmatic Play
 - Envía historial (últimos 100 eventos) y tabla de niveles al conectar
-- Broadcast de nuevos eventos de Spaceman
-- Reconexión automática con backoff exponencial
+- Eventos en lotes de hasta 20 cada 1 segundo
+- Tabla de niveles enviada cada 60-120 segundos (aleatorio)
 - Persistencia con SQLite
-- Auto‑ping cada 10 minutos para evitar que Render suspenda el servicio
+- Auto‑ping cada 10 minutos
 """
 
 import asyncio
@@ -18,8 +18,9 @@ import json
 import time
 import logging
 import os
+import random
 from datetime import datetime
-from typing import Set, Dict, Any
+from typing import Set, Dict, Any, List
 from collections import defaultdict
 import aiosqlite
 
@@ -52,9 +53,18 @@ level_counts = defaultdict(lambda: {'3-4.99': 0, '5-9.99': 0, '10+': 0})
 
 connected_clients: Set[web.WebSocketResponse] = set()
 
-# Variables para generación de IDs locales (cuando no se encuentra ID real)
+# Variables para generación de IDs locales
 _last_gen_time = 0.0
 _gen_counter = 0
+
+# Batching
+event_queue = asyncio.Queue()
+BATCH_SIZE = 20
+BATCH_TIMEOUT = 1.0  # 1 segundo
+
+# Periodic table sender
+TABLE_UPDATE_MIN = 60
+TABLE_UPDATE_MAX = 120
 
 # ============================================
 # FUNCIONES DE BASE DE DATOS
@@ -162,6 +172,60 @@ async def self_ping():
             logger.error(f"[PING] Error en auto‑ping: {e}")
 
 # ============================================
+# BATCH SENDER (cada 1 segundo)
+# ============================================
+async def batch_sender():
+    pending_events = []
+    while True:
+        try:
+            event = await asyncio.wait_for(event_queue.get(), timeout=BATCH_TIMEOUT)
+            pending_events.append(event)
+            if len(pending_events) >= BATCH_SIZE:
+                await send_batch(pending_events.copy())
+                pending_events.clear()
+        except asyncio.TimeoutError:
+            if pending_events:
+                await send_batch(pending_events.copy())
+                pending_events.clear()
+        except Exception as e:
+            logger.error(f"Error en batch_sender: {e}")
+
+async def send_batch(events_list: List[dict]):
+    if not connected_clients:
+        return
+    batch_msg = {
+        'tipo': 'batch',
+        'eventos': events_list
+    }
+    message = json.dumps(batch_msg, default=str)
+    await asyncio.gather(
+        *[client.send_str(message) for client in connected_clients],
+        return_exceptions=True
+    )
+    logger.info(f"Enviado lote de {len(events_list)} eventos")
+
+# ============================================
+# PERIODIC TABLE SENDER (cada 60-120 segundos)
+# ============================================
+async def periodic_table_sender():
+    while True:
+        interval = random.uniform(TABLE_UPDATE_MIN, TABLE_UPDATE_MAX)
+        await asyncio.sleep(interval)
+        if not connected_clients:
+            continue
+        table_msg = {
+            'tipo': 'nivel_counts',
+            'nivel_actual': current_level,
+            'conteos': {k: dict(v) for k, v in level_counts.items()}
+        }
+        message = json.dumps(table_msg, default=str)
+        await asyncio.gather(
+            *[client.send_str(message) for client in connected_clients],
+            return_exceptions=True
+        )
+        logger.info(f"Tabla de niveles enviada (intervalo {interval:.1f}s)")
+
+# ============================================
 # MONITOREO SPACEMAN
 # ============================================
 async def monitor_spaceman():
@@ -195,16 +259,14 @@ async def monitor_spaceman():
                                         if multiplier >= 1.00 and multiplier != spaceman_last_multiplier:
                                             spaceman_last_multiplier = multiplier
 
-                                            # Intentar obtener ID real desde varios campos posibles
+                                            # Intentar obtener ID real
                                             game_id = None
-                                            # Primero en la raíz
                                             if "gameId" in data:
                                                 game_id = data["gameId"]
                                             elif "roundId" in data:
                                                 game_id = data["roundId"]
                                             elif "id" in data:
                                                 game_id = data["id"]
-                                            # Si no, dentro del primer gameResult
                                             elif "gameResult" in data and data["gameResult"]:
                                                 first_result = data["gameResult"][0]
                                                 if "gameId" in first_result:
@@ -214,7 +276,6 @@ async def monitor_spaceman():
                                                 elif "id" in first_result:
                                                     game_id = first_result["id"]
 
-                                            # Si aún no tenemos ID, generamos uno único
                                             if not game_id:
                                                 now = time.time()
                                                 if now == _last_gen_time:
@@ -224,18 +285,18 @@ async def monitor_spaceman():
                                                     _gen_counter = 0
                                                 ts_str = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
                                                 game_id = f"spaceman_{ts_str}_{_gen_counter}_{multiplier:.2f}"
-                                                logger.warning(f"[SPACEMAN] ⚠️ ID no encontrado. Generado: {game_id}")
+                                                logger.warning(f"[SPACEMAN] ⚠️ ID generado: {game_id}")
 
                                             if game_id not in spaceman_events_seen:
                                                 spaceman_events_seen.add(game_id)
 
-                                                # Actualizar nivel según el multiplicador
+                                                # Actualizar nivel
                                                 if multiplier < 2.00:
                                                     current_level -= 1
                                                 else:
                                                     current_level += 1
 
-                                                # Determinar rango para contador
+                                                # Rango
                                                 range_key = None
                                                 if 3.00 <= multiplier <= 4.99:
                                                     range_key = '3-4.99'
@@ -245,11 +306,13 @@ async def monitor_spaceman():
                                                     range_key = '10+'
 
                                                 evento = {
-                                                    'event_id': game_id,
+                                                    'tipo': 'spaceman',
+                                                    'id': game_id,
                                                     'maxMultiplier': multiplier,
                                                     'timestamp_recepcion': datetime.now().isoformat(),
                                                     'nivel': current_level
                                                 }
+                                                # Actualizar estructuras en memoria
                                                 spaceman_history.insert(0, evento)
                                                 if len(spaceman_history) > MAX_HISTORY:
                                                     spaceman_history.pop()
@@ -262,14 +325,10 @@ async def monitor_spaceman():
                                                     await update_count(current_level, range_key)
                                                 await update_current_level(current_level)
 
+                                                # Encolar para batch
+                                                await event_queue.put(evento)
+
                                                 logger.info(f"[SPACEMAN] 🚀 NUEVO: GameID={game_id} | {multiplier:.2f}x | Nivel={current_level}")
-                                                await broadcast({
-                                                    'tipo': 'spaceman',
-                                                    'id': game_id,
-                                                    'maxMultiplier': multiplier,
-                                                    'timestamp_recepcion': evento['timestamp_recepcion'],
-                                                    'nivel': current_level
-                                                })
                                             else:
                                                 logger.info(f"[SPACEMAN] ⚠️ Duplicado: GameID={game_id} | {multiplier:.2f}x")
                             except (json.JSONDecodeError, KeyError, ValueError, IndexError) as e:
@@ -289,26 +348,19 @@ async def monitor_spaceman():
 # ============================================
 # SERVIDOR HTTP + WEBSOCKET
 # ============================================
-async def broadcast(event_data: Dict[str, Any]):
-    if not connected_clients:
-        return
-    message = json.dumps(event_data, default=str)
-    await asyncio.gather(
-        *[client.send_str(message) for client in connected_clients],
-        return_exceptions=True
-    )
-
 async def websocket_handler(request):
     ws = web.WebSocketResponse()
     await ws.prepare(request)
     connected_clients.add(ws)
     try:
+        # Enviar historial completo
         if spaceman_history:
             await ws.send_json({
                 'tipo': 'historial',
                 'api': 'spaceman',
                 'eventos': spaceman_history
             })
+        # Enviar tabla de niveles actual
         await ws.send_json({
             'tipo': 'nivel_counts',
             'nivel_actual': current_level,
@@ -346,10 +398,12 @@ async def start_web_server():
 # ============================================
 async def main():
     logger.info("=" * 60)
-    logger.info("🚀 Monitor exclusivo de SPACEMAN con WebSocket, auto‑ping y SQLite")
+    logger.info("🚀 Monitor Spaceman con batching (1s) y tabla periódica (60-120s)")
     logger.info("=" * 60)
     await init_db()
     await load_from_db()
+    asyncio.create_task(batch_sender())
+    asyncio.create_task(periodic_table_sender())
     tasks = [
         asyncio.create_task(start_web_server()),
         asyncio.create_task(monitor_spaceman()),
