@@ -4,10 +4,12 @@
 """
 Monitor exclusivo para SPACEMAN con servidor HTTP y WebSocket
 - Conecta al WebSocket de Pragmatic Play
-- Envía historial (últimos 100 eventos) y tabla de niveles al conectar
+- Almacena hasta 100,000 eventos en SQLite
+- Envía solo los últimos 100 eventos al conectar
 - Eventos en lotes de hasta 20 cada 1 segundo
 - Tabla de niveles enviada cada 60-120 segundos (aleatorio)
 - Persistencia con SQLite
+- Reconexión automática con backoff exponencial
 - Auto‑ping cada 10 minutos
 """
 
@@ -47,6 +49,7 @@ spaceman_last_multiplier: float = None
 spaceman_events_seen: Set[str] = set()
 spaceman_history: list = []
 MAX_HISTORY = 100
+MAX_STORAGE = 100000
 
 current_level = 0
 level_counts = defaultdict(lambda: {'3-4.99': 0, '5-9.99': 0, '10+': 0})
@@ -60,9 +63,8 @@ _gen_counter = 0
 # Batching
 event_queue = asyncio.Queue()
 BATCH_SIZE = 20
-BATCH_TIMEOUT = 1.0  # 1 segundo
+BATCH_TIMEOUT = 1.0
 
-# Periodic table sender
 TABLE_UPDATE_MIN = 60
 TABLE_UPDATE_MAX = 120
 
@@ -131,11 +133,12 @@ async def save_event(event: dict):
             INSERT OR REPLACE INTO events (id, maxMultiplier, timestamp_recepcion, nivel)
             VALUES (?, ?, ?, ?)
         ''', (event['event_id'], event['maxMultiplier'], event['timestamp_recepcion'], event['nivel']))
+        # Mantener solo los últimos MAX_STORAGE eventos
         await db.execute('''
             DELETE FROM events WHERE id NOT IN (
                 SELECT id FROM events ORDER BY timestamp_recepcion DESC LIMIT ?
             )
-        ''', (MAX_HISTORY,))
+        ''', (MAX_STORAGE,))
         await db.commit()
 
 async def update_count(level: int, range_key: str):
@@ -172,7 +175,7 @@ async def self_ping():
             logger.error(f"[PING] Error en auto‑ping: {e}")
 
 # ============================================
-# BATCH SENDER (cada 1 segundo)
+# BATCH SENDER
 # ============================================
 async def batch_sender():
     pending_events = []
@@ -205,7 +208,7 @@ async def send_batch(events_list: List[dict]):
     logger.info(f"Enviado lote de {len(events_list)} eventos")
 
 # ============================================
-# PERIODIC TABLE SENDER (cada 60-120 segundos)
+# PERIODIC TABLE SENDER
 # ============================================
 async def periodic_table_sender():
     while True:
@@ -307,28 +310,27 @@ async def monitor_spaceman():
 
                                                 evento = {
                                                     'tipo': 'spaceman',
-                                                    'id': game_id,
+                                                    'event_id': game_id,
                                                     'maxMultiplier': multiplier,
                                                     'timestamp_recepcion': datetime.now().isoformat(),
                                                     'nivel': current_level
                                                 }
-                                                # Actualizar estructuras en memoria
+
+                                                # Memoria (últimos 100)
                                                 spaceman_history.insert(0, evento)
                                                 if len(spaceman_history) > MAX_HISTORY:
                                                     spaceman_history.pop()
                                                 if range_key:
                                                     level_counts[current_level][range_key] += 1
 
-                                                # Persistir
+                                                # BD (hasta MAX_STORAGE)
                                                 await save_event(evento)
                                                 if range_key:
                                                     await update_count(current_level, range_key)
                                                 await update_current_level(current_level)
 
-                                                # Encolar para batch
-                                                await event_queue.put(evento)
-
                                                 logger.info(f"[SPACEMAN] 🚀 NUEVO: GameID={game_id} | {multiplier:.2f}x | Nivel={current_level}")
+                                                await event_queue.put(evento)
                                             else:
                                                 logger.info(f"[SPACEMAN] ⚠️ Duplicado: GameID={game_id} | {multiplier:.2f}x")
                             except (json.JSONDecodeError, KeyError, ValueError, IndexError) as e:
@@ -353,14 +355,12 @@ async def websocket_handler(request):
     await ws.prepare(request)
     connected_clients.add(ws)
     try:
-        # Enviar historial completo
         if spaceman_history:
             await ws.send_json({
                 'tipo': 'historial',
                 'api': 'spaceman',
                 'eventos': spaceman_history
             })
-        # Enviar tabla de niveles actual
         await ws.send_json({
             'tipo': 'nivel_counts',
             'nivel_actual': current_level,
@@ -398,7 +398,7 @@ async def start_web_server():
 # ============================================
 async def main():
     logger.info("=" * 60)
-    logger.info("🚀 Monitor Spaceman con batching (1s) y tabla periódica (60-120s)")
+    logger.info("🚀 Monitor Spaceman con almacenamiento 100k eventos, envío últimos 100")
     logger.info("=" * 60)
     await init_db()
     await load_from_db()
