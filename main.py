@@ -4,11 +4,11 @@
 """
 Monitor exclusivo para SPACEMAN con servidor HTTP y WebSocket
 - Conecta al WebSocket de Pragmatic Play
-- Almacena hasta 100,000 eventos en SQLite
+- Almacena eventos en SQLite con reset automático cada 1000 eventos (conserva últimos 100)
 - Envía solo los últimos 100 eventos al conectar
 - Eventos en lotes de hasta 20 cada 1 segundo
 - Tabla de niveles enviada cada 60-120 segundos (aleatorio)
-- Persistencia con SQLite
+- Persistencia con SQLite (archivo se limpia periódicamente)
 - Reconexión automática con backoff exponencial
 - Auto‑ping cada 10 minutos
 """
@@ -49,7 +49,8 @@ spaceman_last_multiplier: float = None
 spaceman_events_seen: Set[str] = set()
 spaceman_history: list = []
 MAX_HISTORY = 100
-MAX_STORAGE = 100000
+RESET_THRESHOLD = 1000          # Número de eventos nuevos que dispara la limpieza
+KEEP_AFTER_RESET = 100          # Eventos que se conservan después del reset
 
 current_level = 0
 level_counts = defaultdict(lambda: {'3-4.99': 0, '5-9.99': 0, '10+': 0})
@@ -67,6 +68,9 @@ BATCH_TIMEOUT = 1.0
 
 TABLE_UPDATE_MIN = 60
 TABLE_UPDATE_MAX = 120
+
+# Contador de eventos desde el último reset (en memoria, se reinicia al resetear DB)
+event_counter_since_reset = 0
 
 # ============================================
 # FUNCIONES DE BASE DE DATOS
@@ -98,8 +102,9 @@ async def init_db():
         await db.commit()
 
 async def load_from_db():
-    global spaceman_history, spaceman_events_seen, level_counts, current_level
+    global spaceman_history, spaceman_events_seen, level_counts, current_level, event_counter_since_reset
     async with aiosqlite.connect(DB_PATH) as db:
+        # Cargar historial (últimos MAX_HISTORY eventos)
         async with db.execute('SELECT id, maxMultiplier, timestamp_recepcion, nivel FROM events ORDER BY timestamp_recepcion DESC LIMIT ?', (MAX_HISTORY,)) as cursor:
             rows = await cursor.fetchall()
             spaceman_history = []
@@ -113,11 +118,15 @@ async def load_from_db():
                 }
                 spaceman_history.append(event)
                 spaceman_events_seen.add(row[0])
+
+        # Cargar conteos por nivel
         async with db.execute('SELECT level, range, count FROM counts') as cursor:
             rows = await cursor.fetchall()
             level_counts.clear()
             for level, rng, cnt in rows:
                 level_counts[level][rng] = cnt
+
+        # Cargar nivel actual
         async with db.execute('SELECT value FROM state WHERE key = "current_level"') as cursor:
             row = await cursor.fetchone()
             if row:
@@ -127,19 +136,104 @@ async def load_from_db():
                 await db.execute('INSERT OR IGNORE INTO state (key, value) VALUES (?, ?)', ('current_level', '0'))
                 await db.commit()
 
+        # Determinar cuántos eventos hay actualmente para inicializar el contador de reset
+        async with db.execute('SELECT COUNT(*) FROM events') as cursor:
+            row = await cursor.fetchone()
+            event_counter_since_reset = row[0] if row else 0
+
 async def save_event(event: dict):
+    global event_counter_since_reset
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute('''
             INSERT OR REPLACE INTO events (id, maxMultiplier, timestamp_recepcion, nivel)
             VALUES (?, ?, ?, ?)
         ''', (event['event_id'], event['maxMultiplier'], event['timestamp_recepcion'], event['nivel']))
-        # Mantener solo los últimos MAX_STORAGE eventos
-        await db.execute('''
-            DELETE FROM events WHERE id NOT IN (
-                SELECT id FROM events ORDER BY timestamp_recepcion DESC LIMIT ?
-            )
-        ''', (MAX_STORAGE,))
         await db.commit()
+    event_counter_since_reset += 1
+
+    # Si alcanzamos el umbral, realizar limpieza
+    if event_counter_since_reset >= RESET_THRESHOLD:
+        await reset_database_keep_last()
+
+async def reset_database_keep_last():
+    """Conserva solo los últimos KEEP_AFTER_RESET eventos, reinicia conteos y nivel actual."""
+    global spaceman_history, spaceman_events_seen, level_counts, current_level, event_counter_since_reset
+    logger.warning(f"Se alcanzaron {event_counter_since_reset} eventos. Iniciando limpieza de base de datos...")
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        # Obtener los últimos KEEP_AFTER_RESET eventos ordenados por timestamp descendente
+        async with db.execute(
+            'SELECT id, maxMultiplier, timestamp_recepcion, nivel FROM events ORDER BY timestamp_recepcion DESC LIMIT ?',
+            (KEEP_AFTER_RESET,)
+        ) as cursor:
+            rows = await cursor.fetchall()
+
+        if not rows:
+            logger.warning("No hay eventos para conservar. Limpieza cancelada.")
+            event_counter_since_reset = 0
+            return
+
+        # Limpiar tabla events
+        await db.execute('DELETE FROM events')
+        # Reinsertar los eventos conservados
+        for row in rows:
+            await db.execute(
+                'INSERT INTO events (id, maxMultiplier, timestamp_recepcion, nivel) VALUES (?, ?, ?, ?)',
+                row
+            )
+
+        # Limpiar tabla counts
+        await db.execute('DELETE FROM counts')
+
+        # Recalcular level_counts a partir de los eventos conservados
+        new_level_counts = defaultdict(lambda: {'3-4.99': 0, '5-9.99': 0, '10+': 0})
+        for row in rows:
+            multiplier = row[1]
+            nivel = row[3]
+            range_key = None
+            if 3.00 <= multiplier <= 4.99:
+                range_key = '3-4.99'
+            elif 5.00 <= multiplier <= 9.99:
+                range_key = '5-9.99'
+            elif multiplier >= 10.00:
+                range_key = '10+'
+            if range_key:
+                new_level_counts[nivel][range_key] += 1
+
+        # Insertar nuevos conteos en la tabla counts
+        for level, ranges in new_level_counts.items():
+            for rng, cnt in ranges.items():
+                await db.execute(
+                    'INSERT INTO counts (level, range, count) VALUES (?, ?, ?)',
+                    (level, rng, cnt)
+                )
+
+        # El nivel actual debe ser el del evento más reciente (el primero de rows, pues están ordenados DESC)
+        new_current_level = rows[0][3] if rows else 0
+        await db.execute(
+            'INSERT OR REPLACE INTO state (key, value) VALUES (?, ?)',
+            ('current_level', str(new_current_level))
+        )
+        await db.commit()
+
+        # Actualizar variables en memoria
+        spaceman_history = []
+        spaceman_events_seen.clear()
+        for row in rows[:MAX_HISTORY]:  # Solo los primeros MAX_HISTORY para el historial en memoria
+            event = {
+                'event_id': row[0],
+                'maxMultiplier': row[1],
+                'timestamp_recepcion': row[2],
+                'nivel': row[3]
+            }
+            spaceman_history.append(event)
+            spaceman_events_seen.add(row[0])
+
+        level_counts = new_level_counts
+        current_level = new_current_level
+        event_counter_since_reset = len(rows)
+
+    logger.info(f"Limpieza completada. Conservados {len(rows)} eventos. Nivel actual: {current_level}")
 
 async def update_count(level: int, range_key: str):
     async with aiosqlite.connect(DB_PATH) as db:
@@ -323,7 +417,7 @@ async def monitor_spaceman():
                                                 if range_key:
                                                     level_counts[current_level][range_key] += 1
 
-                                                # BD (hasta MAX_STORAGE)
+                                                # Base de datos (con control de reset automático)
                                                 await save_event(evento)
                                                 if range_key:
                                                     await update_count(current_level, range_key)
@@ -398,7 +492,7 @@ async def start_web_server():
 # ============================================
 async def main():
     logger.info("=" * 60)
-    logger.info("🚀 Monitor Spaceman con almacenamiento 100k eventos, envío últimos 100")
+    logger.info("🚀 Monitor Spaceman con reset automático cada 1000 eventos (conserva últimos 100)")
     logger.info("=" * 60)
     await init_db()
     await load_from_db()
